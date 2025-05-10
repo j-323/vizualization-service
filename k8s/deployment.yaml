@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: visual-agent
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: visual-agent
+  template:
+    metadata:
+      labels:
+        app: visual-agent
+    spec:
+      containers:
+      - name: web
+        image: your-registry/visual-agent:latest
+        envFrom:
+          - secretRef:
+              name: visual-agent-secrets
+        ports:
+          - containerPort: 8000
+      - name: worker
+        image: your-registry/visual-agent:latest
+        command: ["celery", "-A", "src.services.async_worker.celery_app", "worker", "--loglevel=info"]
+        envFrom:
+          - secretRef:
+              name: visual-agent-secrets

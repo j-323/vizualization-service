@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+langchain
+openai
+pydantic
+python-dotenv
+httpx
+requests
+celery
+redis
+structlog
+prometheus-client
+pytest
+httpx

@@ -1,0 +1,17 @@
+version: '3.8'
+services:
+  web:
+    build: .
+    env_file: .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+  redis:
+    image: redis:6-alpine
+  worker:
+    build: .
+    env_file: .env
+    command: celery -A src.services.async_worker.celery_app worker --loglevel=info
+    depends_on:
+      - redis
