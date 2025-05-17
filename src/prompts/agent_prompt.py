@@ -1,54 +1,62 @@
-# src/prompts/agent_prompt.py
-
+import json
+import logging
 from langchain.prompts import (
     ChatPromptTemplate,
     SystemMessagePromptTemplate,
     HumanMessagePromptTemplate,
     AIMessagePromptTemplate,
 )
+from src.config.settings import Settings
 
-# 1. Системное сообщение: объясняем роль агента и требование по комплаенсу
-SYSTEM_MESSAGE = """\
-Вы — интеллектуальный агент, который оркестрирует пять инструментов генерации изображений и видео.
-Перед тем, как выбрать инструмент, вы **обязательно** проверяете пользовательский запрос на соответствие
-законам, этическим нормам и политике безопасности:
-- Если запрос нарушает закон или этические правила (например, пропаганда насилия, нелегальный контент),
-  откажитесь с кратким объяснением: "Запрос запрещён из-за ...".
-- Если всё в порядке, выберите наиболее подходящий инструмент и сформируйте для него запрос в точном формате:
+logger = logging.getLogger(__name__)
+settings = Settings()
+
+# Загружаем правила комплаенса из JSON-конфига
+try:
+    with open(settings.COMPLIANCE_POLICIES_PATH, encoding="utf-8") as f:
+        policies = json.load(f)
+except Exception as e:
+    logger.error("Не удалось загрузить политики комплаенса", exc_info=e)
+    policies = {"banned_categories": []}
+
+# Системное сообщение с динамичной вставкой запрещённых категорий
+SYSTEM_MESSAGE = f"""\
+Вы — интеллектуальный агент, оркестрирующий пять инструментов генерации.
+Перед выполнением запроса обязательно проверяйте его на соответствие:
+- Запрещённый контент: {', '.join(policies['banned_categories'])}.
+Если запрос нарушает нормы — откажите с объяснением, иначе выберите инструмент и верните:
 
 <Имя_инструмента>
-<Промпт для этого инструмента>
+<Точный промпт для этого инструмента>
 """
 
-# 2. Несколько демонстрационных примеров "few-shot"
-EXAMPLE_1_USER = """Пользователь запросил:
-Сгенерируй фотореалистичное изображение заката над горами"""
-EXAMPLE_1_ASSISTANT = """ImageB_API
-Фотореалистичное изображение заката над высокими снежными горами с мягким туманом"""
+# Загружаем few-shot примеры из внешнего файла
+examples = []
+try:
+    with open(settings.FEWSHOT_EXAMPLES_PATH, encoding="utf-8") as f:
+        examples = json.load(f)
+except Exception as e:
+    logger.warning("Few-shot примеры не загружены", exc_info=e)
 
-EXAMPLE_2_USER = """Пользователь запросил:
-Создай короткую MP4-анимацию бабочки, летящей над цветами"""
-EXAMPLE_2_ASSISTANT = """VideoD_Local
-Короткая loop-анимация (MP4): мультяшная бабочка, летающая над полем ярких полевых цветов"""
+# Строим шаблоны сообщений
+messages = [SystemMessagePromptTemplate.from_template(SYSTEM_MESSAGE)]
+for ex in examples:
+    messages.append(HumanMessagePromptTemplate.from_template(ex["user"]))
+    messages.append(AIMessagePromptTemplate.from_template(ex["assistant"]))
+# Финальное место для реального запроса
+messages.append(HumanMessagePromptTemplate.from_template("{user_request}"))
 
-# 3. Шаблон для реального пользовательского сообщения
-USER_TEMPLATE = """Пользователь запросил:
-{user_request}
-Дайте ответ в формате, указанном в системном сообщении."""
-
-# 4. Собираем ChatPromptTemplate со всеми сообщениями
-agent_prompt: ChatPromptTemplate = ChatPromptTemplate.from_messages([
-    SystemMessagePromptTemplate.from_template(SYSTEM_MESSAGE),
-    HumanMessagePromptTemplate.from_template(EXAMPLE_1_USER),
-    AIMessagePromptTemplate.from_template(EXAMPLE_1_ASSISTANT),
-    HumanMessagePromptTemplate.from_template(EXAMPLE_2_USER),
-    AIMessagePromptTemplate.from_template(EXAMPLE_2_ASSISTANT),
-    HumanMessagePromptTemplate.from_template(USER_TEMPLATE),
-])
+agent_prompt = ChatPromptTemplate.from_messages(messages)
 
 def build_agent_prompt(user_request: str) -> str:
     """
-    Формирует финальный промпт для LangChain-агента,
-    включая проверку комплаенса и демонстрационные примеры.
+    Формирует финальный систем+few-shot+user промпт,
+    логирует ошибки сборки.
     """
-    return agent_prompt.format_prompt(user_request=user_request).to_string()
+    try:
+        return agent_prompt.format_prompt(user_request=user_request).to_string()
+    except Exception as e:
+        logger.error("Ошибка при формировании промпта агента", exc_info=e)
+        # в крайнем случае возвращаем базовый системный + user
+        fallback = SYSTEM_MESSAGE + "\n\nПользователь запросил:\n" + user_request
+        return fallback
