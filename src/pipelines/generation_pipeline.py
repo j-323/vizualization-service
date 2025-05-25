@@ -1,12 +1,14 @@
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
+from concurrent.futures import ThreadPoolExecutor, as_completed, FIRST_COMPLETED, wait
 from typing import Tuple, List, Dict, Optional
 
 from src.registry.model_registry import select_candidates
 from src.models.base import ModelClient
 from src.models.evaluator import CLIPScorer
 from src.utils.cache import RedisCache
+
+logger = logging.getLogger(__name__)
 
 class GenerationPipeline:
     def __init__(
@@ -16,7 +18,6 @@ class GenerationPipeline:
         top_k: int = 2,
         timeout: int = 60
     ):
-        self.logger = logging.getLogger(__name__)
         self.cache = cache
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.top_k = top_k
@@ -25,110 +26,82 @@ class GenerationPipeline:
 
     def generate(self, prompt: str) -> Tuple[str, str]:
         start_ts = time.time()
-        img_or_vid = self._determine_type(prompt)
+        kind = "video" if "mp4" in prompt.lower() or "анимац" in prompt.lower() else "image"
 
-        # 1) Попробовать из кэша
+        # кэширование
         if self.cache:
-            cached = self.cache.get(prompt)
-            if cached:
-                self.logger.debug(f"Cache hit: {cached}")
-                return cached, img_or_vid
+            hit = self.cache.get(prompt)
+            if hit:
+                logger.debug(f"cache hit for '{prompt}'")
+                return hit, kind
 
-        # 2) Получаем кандидатов и фильтруем по health_check
+        # выбираем кандидатов с пройденным health_check
         candidates = [
-            m for m in select_candidates(prompt, img_or_vid)
-            if m.health_check()
+            m for m in select_candidates(prompt, kind) if m.health_check()
         ]
 
-        # 3) Параллельно запускаем top_k моделей
-        results = self._generate_concurrent(candidates[: self.top_k], prompt)
-
-        # 4) Выбираем финальную ссылку
-        if img_or_vid == "image":
-            url = self._select_best_image(results, prompt)
-        else:
-            url = self._select_video(results, candidates, prompt)
-
-        # 5) Кэшируем и логируем
-        if self.cache:
-            self.cache.set(prompt, url)
-        elapsed = time.time() - start_ts
-        self.logger.info(f"Generated {img_or_vid} in {elapsed:.2f}s → {url}")
-        return url, img_or_vid
-
-    def _determine_type(self, prompt: str) -> str:
-        low = prompt.lower()
-        return "video" if "mp4" in low or "анимац" in low else "image"
-
-    def _generate_concurrent(
-        self,
-        models: List[ModelClient],
-        prompt: str
-    ) -> Dict[str, Optional[str]]:
-        futures = {self.executor.submit(m.generate, prompt): m.name for m in models}
+        # параллельная генерация первых top_k моделей
         urls: Dict[str, Optional[str]] = {}
-        try:
+        futures = {self.executor.submit(m.generate, prompt): m for m in candidates[:self.top_k]}
+
+        # для видео — берём первый успешно завершившийся
+        if kind == "video":
+            done, _ = wait(futures, timeout=self.timeout, return_when=FIRST_COMPLETED)
+            for fut in done:
+                try:
+                    url = fut.result()
+                    urls[futures[fut].name] = url
+                    break
+                except Exception as e:
+                    logger.warning(f"{futures[fut].name} failed: {e}")
+        else:
+            # для изображений — ждём всех завершений или таймаут
             for fut in as_completed(futures, timeout=self.timeout):
-                name = futures[fut]
+                name = futures[fut].name
                 try:
                     urls[name] = fut.result()
                 except Exception as e:
-                    self.logger.warning(f"Model {name} failed: {e}")
-                    urls[name] = None
-        except TimeoutError:
-            self.logger.warning("Timeout reached during concurrent generation")
-        return urls
+                    logger.warning(f"{name} failed: {e}")
 
-    def _select_best_image(
-        self,
-        results: Dict[str, Optional[str]],
-        prompt: str
-    ) -> str:
-        scores: Dict[str, float] = {}
-        for name, url in results.items():
-            if url:
+        # выбор финального URL
+        if kind == "image":
+            url = self._select_best_image(urls, prompt)
+        else:
+            url = next(iter(urls.values()), None) or self._fallback(prompt, kind, candidates)
+
+        if not url:
+            url = self._fallback(prompt, kind, candidates)
+
+        # кэш и лог
+        if self.cache:
+            self.cache.set(prompt, url)
+        elapsed = time.time() - start_ts
+        logger.info(f"Generated {kind} in {elapsed:.2f}s: {url}")
+        return url, kind
+
+    def _select_best_image(self, results: Dict[str, Optional[str]], prompt: str) -> Optional[str]:
+        scores = {}
+        for name, path in results.items():
+            if path:
                 try:
-                    scores[name] = self.scorer.score(url, prompt)
+                    scores[name] = self.scorer.score(path, prompt)
                 except Exception as e:
-                    self.logger.warning(f"Scoring failed for {name}: {e}")
+                    logger.warning(f"scoring {name} failed: {e}")
         if scores:
             best = max(scores, key=scores.get)
-            return results[best]  # type: ignore
-        return self._fallback_sequence(prompt)
+            return results[best]
+        return None
 
-    def _select_video(
+    def _fallback(
         self,
-        results: Dict[str, Optional[str]],
-        candidates: List[ModelClient],
-        prompt: str
+        prompt: str,
+        kind: str,
+        candidates: List[ModelClient]
     ) -> str:
-        # возвращаем первый успешный
-        for url in results.values():
-            if url:
-                return url
-        # иначе fallback по очереди
-        return self._fallback_sequence(prompt)
-
-    def _fallback_sequence(self, prompt: str) -> str:
-        self.logger.debug("Entering fallback sequence")
-        for model in select_candidates(prompt, self._determine_type(prompt))[self.top_k :]:
+        logger.debug("fallback sequence start")
+        for model in candidates[self.top_k:]:
             try:
-                url = model.generate(prompt)
-                self.logger.debug(f"Fallback succeeded with {model.name}")
-                return url
+                return model.generate(prompt)
             except Exception as e:
-                self.logger.warning(f"Fallback model {model.name} failed: {e}")
-        raise RuntimeError("Все модели недоступны или вернули ошибку")
-
-
-# DI-экземпляр
-from src.utils.cache import RedisCache
-from src.config.settings import Settings
-
-settings = Settings()
-pipeline = GenerationPipeline(
-    cache=RedisCache(settings.REDIS_URL),
-    max_workers=4,
-    top_k=3,
-    timeout=90
-)
+                logger.warning(f"fallback model {model.name} failed: {e}")
+        raise RuntimeError("All models failed")
